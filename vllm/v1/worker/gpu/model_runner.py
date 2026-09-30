@@ -2066,6 +2066,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # sampled tokens broadcast from the last rank and update local state.
             assert self.pp_handler is not None
             all_decode_next = self.pp_handler.receive(input_batch)
+            if self.aux_output_connector is not None:
+                self.aux_output_connector.send_stage_output(input_batch)
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
             self.postprocess_num_computed_tokens(input_batch)
