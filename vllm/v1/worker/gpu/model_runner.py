@@ -34,6 +34,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.compilation.wrapper import compile_model_with_stock_torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.distributed.aux_output_connector.connector import AuxOutputConnectorMetadata
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
@@ -84,6 +85,7 @@ from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
+    AsyncAuxOutput,
     AsyncOutput,
     AsyncPoolingOutput,
     StepTimingCollector,
@@ -1690,12 +1692,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
-            if self.aux_output_connector is not None:
-                # Register this step before the GPU forward.
-                self.aux_output_connector.begin_step(
-                    scheduler_output.aux_output_connector_metadata
-                )
             if scheduler_output.total_num_scheduled_tokens == 0:
+                if self.aux_output_connector is not None:
+                    self.aux_output_connector.begin_step(
+                        scheduler_output.aux_output_connector_metadata
+                    )
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return self._merge_ec_connector_no_forward(
@@ -2019,6 +2020,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_intermediate_tensors = model_output
 
         finished_req_ids = scheduler_output.finished_req_ids
+        aux_output_connector_metadata = scheduler_output.aux_output_connector_metadata
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -2029,6 +2031,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=cudagraph_stats,
+            aux_output_connector_metadata=aux_output_connector_metadata,
         )
 
         if not self.is_last_pp_rank:
@@ -2044,10 +2047,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @step_eplb_after()
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
-    ) -> AsyncOutput | ModelRunnerOutput | None:
+    ) -> AsyncOutput | AsyncAuxOutput | ModelRunnerOutput | None:
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
+
+        if self.aux_output_connector is not None:
+            # Begin the step here so its CPU work overlaps the enqueued forward.
+            self.aux_output_connector.begin_step(
+                self.execute_model_state.aux_output_connector_metadata
+            )
 
         input_batch = self.execute_model_state.input_batch
         attn_metadata = self.execute_model_state.attn_metadata
@@ -2065,13 +2074,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
             assert self.pp_handler is not None
-            all_decode_next = self.pp_handler.receive(input_batch)
-            if self.aux_output_connector is not None:
-                self.aux_output_connector.send_stage_output(input_batch)
+            pending_recv = self.pp_handler.receive(input_batch)
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
             self.postprocess_num_computed_tokens(input_batch)
-            if not all_decode_next:
+            if pending_recv is None or not pending_recv.need_sampled_mask.all():
                 # Might contain non-final prefill chunks, which will be scheduled
                 # in the immediate next step (rather than in pp_size steps).
                 self.model_state.postprocess_state(input_batch.idx_mapping, 0)
@@ -2080,7 +2087,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
             # The first PP rank holds the encoder cache, so pass its EC output on.
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-            return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
+            output = ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
+            pending_aux_output = None
+            if self.aux_output_connector is not None:
+                pending_aux_output = self.aux_output_connector.prepare_output(
+                    input_batch
+                )
+            if pending_aux_output is None:
+                return output
+            return AsyncAuxOutput(
+                model_runner_output=output,
+                pending_aux_output=pending_aux_output,
+                pending_recv=pending_recv,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+            )
 
         # Last rank: sample tokens
         assert hidden_states is not None
@@ -2369,6 +2390,7 @@ class ExecuteModelState(NamedTuple):
     finished_req_ids: set[str]
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
+    aux_output_connector_metadata: AuxOutputConnectorMetadata | None
 
 
 class BatchReqState(NamedTuple):
